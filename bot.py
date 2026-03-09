@@ -4,7 +4,7 @@ import asyncio
 import logging
 import requests
 from datetime import datetime
-from openai import OpenAI
+from groq import groq
 from telegram import Bot
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
