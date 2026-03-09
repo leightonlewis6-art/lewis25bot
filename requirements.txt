@@ -1,3 +1,5 @@
-Bot starting - every 15 min
-Generating signal...
-Sent: BUY @ 2645.30
+groq==0.11.0
+httpx==0.27.2
+python-telegram-bot==21.6
+apscheduler==3.10.4
+requests==2.32.3
