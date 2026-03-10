@@ -20,44 +20,60 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 log = logging.getLogger(__name__)
 client = Groq(api_key=GROQ_API_KEY)
 
+# Gold is currently trading ~$5000-$5500 range in 2026
+GOLD_PRICE_MIN = 3000
+GOLD_PRICE_MAX = 8000
+
 
 def get_gold_price():
-    headers = {"User-Agent": "Mozilla/5.0"}
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
 
-    # Source 1: Yahoo Finance GC=F (Gold Futures)
+    # Source 1: Yahoo Finance GC=F futures
     try:
-        url = "https://query1.finance.yahoo.com/v8/finance/chart/GC=F?interval=1m&range=1d"
+        url = "https://query1.finance.yahoo.com/v8/finance/chart/GC=F"
         r = requests.get(url, headers=headers, timeout=8)
-        data = r.json()
-        price = data["chart"]["result"][0]["meta"]["regularMarketPrice"]
-        if price and 1500 < float(price) < 5000:
-            log.info("Yahoo Finance price: $" + str(price))
-            return float(price), "Yahoo Finance (GC=F)"
+        price = r.json()["chart"]["result"][0]["meta"]["regularMarketPrice"]
+        price = float(price)
+        if GOLD_PRICE_MIN < price < GOLD_PRICE_MAX:
+            log.info("Price from Yahoo GC=F: $" + str(price))
+            return price, "Yahoo Finance"
     except Exception as e:
-        log.warning("Yahoo Finance failed: " + str(e))
+        log.warning("Yahoo GC=F failed: " + str(e))
 
-    # Source 2: Yahoo Finance XAUUSD
+    # Source 2: Yahoo Finance XAUUSD=X spot
     try:
-        url = "https://query1.finance.yahoo.com/v8/finance/chart/XAUUSD=X?interval=1m&range=1d"
+        url = "https://query2.finance.yahoo.com/v8/finance/chart/XAUUSD=X"
         r = requests.get(url, headers=headers, timeout=8)
-        data = r.json()
-        price = data["chart"]["result"][0]["meta"]["regularMarketPrice"]
-        if price and 1500 < float(price) < 5000:
-            log.info("Yahoo XAUUSD price: $" + str(price))
-            return float(price), "Yahoo Finance (XAUUSD)"
+        price = r.json()["chart"]["result"][0]["meta"]["regularMarketPrice"]
+        price = float(price)
+        if GOLD_PRICE_MIN < price < GOLD_PRICE_MAX:
+            log.info("Price from Yahoo XAUUSD: $" + str(price))
+            return price, "Yahoo Finance Spot"
     except Exception as e:
         log.warning("Yahoo XAUUSD failed: " + str(e))
 
-    # Source 3: metals.live
+    # Source 3: Twelve Data free API
     try:
-        r = requests.get("https://api.metals.live/v1/spot/gold", timeout=8)
-        data = r.json()
-        price = data[0].get("price") if isinstance(data, list) else data.get("price")
-        if price and 1500 < float(price) < 5000:
-            log.info("metals.live price: $" + str(price))
-            return float(price), "metals.live"
+        url = "https://api.twelvedata.com/price?symbol=XAU/USD&apikey=demo"
+        r = requests.get(url, timeout=8)
+        price = float(r.json().get("price", 0))
+        if GOLD_PRICE_MIN < price < GOLD_PRICE_MAX:
+            log.info("Price from TwelveData: $" + str(price))
+            return price, "TwelveData"
     except Exception as e:
-        log.warning("metals.live failed: " + str(e))
+        log.warning("TwelveData failed: " + str(e))
+
+    # Source 4: goldprice.org API
+    try:
+        url = "https://data-asg.goldprice.org/dbXRates/USD"
+        r = requests.get(url, headers=headers, timeout=8)
+        data = r.json()
+        price = float(data["items"][0]["xauPrice"])
+        if GOLD_PRICE_MIN < price < GOLD_PRICE_MAX:
+            log.info("Price from goldprice.org: $" + str(price))
+            return price, "GoldPrice.org"
+    except Exception as e:
+        log.warning("goldprice.org failed: " + str(e))
 
     log.warning("All price sources failed")
     return None, "unavailable"
@@ -76,39 +92,39 @@ def build_prompt(price, source):
     else:
         session = "Asian"
 
-    if price:
-        p = round(price, 2)
-        context = (
-            "LIVE GOLD PRICE RIGHT NOW: $" + str(p) + " (source: " + source + ")\n"
-            "Current UTC time: " + now_utc.strftime("%H:%M") + " | Trading session: " + session + "\n\n"
-            "IMPORTANT: Your entry price MUST be within $1.00 of $" + str(p) + "\n"
-            "For scalping use SL of $8-$12, TP1=$8, TP2=$15, TP3=$25\n"
-            "Support levels should be BELOW $" + str(p) + "\n"
-            "Resistance levels should be ABOVE $" + str(p)
-        )
-    else:
-        context = "Live price unavailable. Use your best estimate for current XAU/USD price."
-
-    return """You are a professional XAU/USD scalping trader with 10 years experience.
-
-""" + context + """
-
-Generate a precise scalping signal. Return ONLY this exact JSON structure, no other text:
-{"signal":"BUY","timeframe":"5m","entry":0.00,"stopLoss":0.00,"takeProfit1":0.00,"takeProfit2":0.00,"takeProfit3":0.00,"riskReward":"1:2.0","confidence":75,"technicalSummary":"2 sentences about RSI MACD EMA price action","sentiment":"1 sentence about gold market conditions","keyLevels":{"support":[0.00,0.00],"resistance":[0.00,0.00]},"invalidationLevel":0.00,"sessionContext":"London"}"""
+    p = round(price, 2)
+    return (
+        "You are a professional XAU/USD scalping trader.\n\n"
+        "TODAY'S LIVE GOLD PRICE: $" + str(p) + " per troy ounce (source: " + source + ")\n"
+        "Current UTC time: " + now_utc.strftime("%H:%M") + " | Session: " + session + "\n\n"
+        "CRITICAL RULES - you MUST follow these exactly:\n"
+        "1. entry price MUST be between $" + str(round(p - 2, 2)) + " and $" + str(round(p + 2, 2)) + "\n"
+        "2. For BUY: stopLoss = entry minus $8 to $12, takeProfit1 = entry plus $8, takeProfit2 = entry plus $16, takeProfit3 = entry plus $28\n"
+        "3. For SELL: stopLoss = entry plus $8 to $12, takeProfit1 = entry minus $8, takeProfit2 = entry minus $16, takeProfit3 = entry minus $28\n"
+        "4. support levels must be BELOW $" + str(p) + "\n"
+        "5. resistance levels must be ABOVE $" + str(p) + "\n"
+        "6. invalidationLevel for BUY = entry minus $15, for SELL = entry plus $15\n\n"
+        "Return ONLY this JSON, no other text:\n"
+        '{"signal":"BUY","timeframe":"5m","entry":' + str(p) + ',"stopLoss":0.00,"takeProfit1":0.00,"takeProfit2":0.00,"takeProfit3":0.00,"riskReward":"1:2.0","confidence":75,"technicalSummary":"write 2 sentences about current technicals","sentiment":"write 1 sentence about gold market","keyLevels":{"support":[0.00,0.00],"resistance":[0.00,0.00]},"invalidationLevel":0.00,"sessionContext":"' + session + '"}'
+    )
 
 
 def generate_signal():
     price, source = get_gold_price()
+
+    if not price:
+        raise ValueError("Could not fetch live gold price from any source")
+
     prompt = build_prompt(price, source)
 
     response = client.chat.completions.create(
         model="llama-3.3-70b-versatile",
         messages=[
             {"role": "system", "content": prompt},
-            {"role": "user", "content": "Generate the signal now. Return ONLY the JSON."}
+            {"role": "user", "content": "Generate the scalping signal now. Return ONLY the JSON object."}
         ],
         max_tokens=500,
-        temperature=0.3,
+        temperature=0.2,
     )
 
     raw = response.choices[0].message.content
@@ -116,7 +132,10 @@ def generate_signal():
     start = raw.find("{")
     end = raw.rfind("}") + 1
     signal = json.loads(raw[start:end])
-    signal["_livePrice"] = "$" + str(round(price, 2)) if price else "unavailable"
+
+    # Force correct entry price regardless of what AI returns
+    signal["entry"] = round(price, 2)
+    signal["_livePrice"] = "$" + str(round(price, 2))
     signal["_source"] = source
     return signal
 
@@ -137,7 +156,7 @@ def fmt(s):
         "Timeframe: " + s.get("timeframe", "?") + " | Session: " + s.get("sessionContext", "?"),
         "Live Spot: " + live + " (" + src + ")",
         "--------------------",
-        "Entry:        $" + str(round(s.get("entry", 0), 2)),
+        "Entry:        " + live,
         "Stop Loss:    $" + str(round(s.get("stopLoss", 0), 2)),
         "TP1:          $" + str(round(s.get("takeProfit1", 0), 2)),
         "TP2:          $" + str(round(s.get("takeProfit2", 0), 2)),
@@ -165,7 +184,7 @@ async def job():
     try:
         s = generate_signal()
         await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=fmt(s))
-        log.info("Sent: " + str(s.get("signal")) + " @ " + str(s.get("entry")) + " | Live: " + str(s.get("_livePrice")))
+        log.info("Sent: " + str(s.get("signal")) + " | Live price: " + str(s.get("_livePrice")))
     except Exception as e:
         log.error("Error: " + str(e))
         try:
