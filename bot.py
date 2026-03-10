@@ -3,6 +3,8 @@ import json
 import asyncio
 import logging
 import requests
+import pandas as pd
+import numpy as np
 from datetime import datetime, timezone
 from groq import Groq
 from telegram import Bot
@@ -11,7 +13,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
-INTERVAL_MINUTES = int(os.environ.get("INTERVAL_MINUTES", "15"))
+CHECK_INTERVAL = int(os.environ.get("CHECK_INTERVAL", "15"))  # how often to scan in minutes
 
 if not all([TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, GROQ_API_KEY]):
     raise RuntimeError("Missing env vars - check Railway Variables tab")
@@ -20,157 +22,295 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(message)s")
 log = logging.getLogger(__name__)
 client = Groq(api_key=GROQ_API_KEY)
 
-# Gold is currently trading ~$5000-$5500 range in 2026
-GOLD_PRICE_MIN = 3000
-GOLD_PRICE_MAX = 8000
+PAIRS = {
+    "XAUUSD": {"yahoo": "GC=F",     "min": 3000, "max": 8000, "pip": 0.1,  "name": "XAU/USD (Gold)"},
+    "USDJPY": {"yahoo": "JPY=X",    "min": 100,  "max": 200,  "pip": 0.01, "name": "USD/JPY"},
+}
+
+# Track last signal time per pair to avoid spamming
+last_signal = {"XAUUSD": None, "USDJPY": None}
+MIN_SIGNAL_GAP = 60  # minimum minutes between signals per pair
 
 
-def get_gold_price():
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+# ── PRICE & CANDLE DATA ────────────────────────────────────────────────────
 
-    # Source 1: Yahoo Finance GC=F futures
+def fetch_candles(yahoo_symbol, period="1d", interval="5m"):
+    headers = {"User-Agent": "Mozilla/5.0"}
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{yahoo_symbol}?interval={interval}&range={period}"
+    r = requests.get(url, headers=headers, timeout=10)
+    data = r.json()
+    result = data["chart"]["result"][0]
+    timestamps = result["timestamp"]
+    ohlcv = result["indicators"]["quote"][0]
+    df = pd.DataFrame({
+        "time":   pd.to_datetime(timestamps, unit="s", utc=True),
+        "open":   ohlcv["open"],
+        "high":   ohlcv["high"],
+        "low":    ohlcv["low"],
+        "close":  ohlcv["close"],
+        "volume": ohlcv["volume"],
+    }).dropna()
+    return df
+
+
+def get_live_price(yahoo_symbol):
+    headers = {"User-Agent": "Mozilla/5.0"}
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{yahoo_symbol}"
+    r = requests.get(url, headers=headers, timeout=8)
+    return float(r.json()["chart"]["result"][0]["meta"]["regularMarketPrice"])
+
+
+# ── TECHNICAL INDICATORS ───────────────────────────────────────────────────
+
+def calc_rsi(series, period=14):
+    delta = series.diff()
+    gain = delta.clip(lower=0).rolling(period).mean()
+    loss = (-delta.clip(upper=0)).rolling(period).mean()
+    rs = gain / loss
+    return 100 - (100 / (1 + rs))
+
+
+def calc_ema(series, period):
+    return series.ewm(span=period, adjust=False).mean()
+
+
+def calc_support_resistance(df, lookback=50):
+    recent = df.tail(lookback)
+    highs = recent["high"].nlargest(3).values.tolist()
+    lows  = recent["low"].nsmallest(3).values.tolist()
+    return sorted(lows), sorted(highs)
+
+
+def calc_volume_signal(df):
+    avg_vol = df["volume"].tail(20).mean()
+    last_vol = df["volume"].iloc[-1]
+    return last_vol / avg_vol if avg_vol > 0 else 1.0
+
+
+def get_indicators(df):
+    close = df["close"]
+    rsi = calc_rsi(close).iloc[-1]
+    ema9  = calc_ema(close, 9).iloc[-1]
+    ema21 = calc_ema(close, 21).iloc[-1]
+    ema50 = calc_ema(close, 50).iloc[-1]
+    prev_ema9  = calc_ema(close, 9).iloc[-2]
+    prev_ema21 = calc_ema(close, 21).iloc[-2]
+    supports, resistances = calc_support_resistance(df)
+    vol_ratio = calc_volume_signal(df)
+    current_price = close.iloc[-1]
+    prev_price    = close.iloc[-2]
+
+    # EMA crossover signals
+    bullish_cross = prev_ema9 <= prev_ema21 and ema9 > ema21
+    bearish_cross = prev_ema9 >= prev_ema21 and ema9 < ema21
+
+    return {
+        "price":         round(current_price, 5),
+        "rsi":           round(rsi, 2),
+        "ema9":          round(ema9, 5),
+        "ema21":         round(ema21, 5),
+        "ema50":         round(ema50, 5),
+        "bullish_cross": bullish_cross,
+        "bearish_cross": bearish_cross,
+        "ema_trend":     "bullish" if ema9 > ema21 > ema50 else "bearish" if ema9 < ema21 < ema50 else "mixed",
+        "vol_ratio":     round(vol_ratio, 2),
+        "high_volume":   vol_ratio > 1.3,
+        "supports":      [round(x, 5) for x in supports],
+        "resistances":   [round(x, 5) for x in resistances],
+        "price_change":  round(current_price - prev_price, 5),
+    }
+
+
+# ── SETUP DETECTION ────────────────────────────────────────────────────────
+
+def detect_setup(ind):
+    signals = []
+    score = 0
+
+    rsi   = ind["rsi"]
+    price = ind["price"]
+
+    # RSI signals
+    if rsi < 35:
+        signals.append("RSI oversold (" + str(rsi) + ")")
+        score += 2
+    elif rsi > 65:
+        signals.append("RSI overbought (" + str(rsi) + ")")
+        score -= 2
+    elif 40 <= rsi <= 55:
+        signals.append("RSI neutral (" + str(rsi) + ")")
+
+    # EMA crossover
+    if ind["bullish_cross"]:
+        signals.append("Bullish EMA9/21 crossover")
+        score += 3
+    elif ind["bearish_cross"]:
+        signals.append("Bearish EMA9/21 crossover")
+        score -= 3
+
+    # EMA trend
+    if ind["ema_trend"] == "bullish":
+        signals.append("EMA trend: bullish (9>21>50)")
+        score += 2
+    elif ind["ema_trend"] == "bearish":
+        signals.append("EMA trend: bearish (9<21<50)")
+        score -= 2
+
+    # Volume confirmation
+    if ind["high_volume"]:
+        signals.append("High volume confirmation (" + str(ind["vol_ratio"]) + "x avg)")
+        score = score + 1 if score > 0 else score - 1
+
+    # Support / resistance proximity
+    for sup in ind["supports"]:
+        if abs(price - sup) / price < 0.003:
+            signals.append("Price near support $" + str(sup))
+            score += 1
+
+    for res in ind["resistances"]:
+        if abs(price - res) / price < 0.003:
+            signals.append("Price near resistance $" + str(res))
+            score -= 1
+
+    # Determine direction
+    if score >= 4:
+        direction = "BUY"
+    elif score <= -4:
+        direction = "SELL"
+    else:
+        direction = "NEUTRAL"
+
+    confidence = min(95, 50 + abs(score) * 8)
+
+    return {
+        "direction":  direction,
+        "score":      score,
+        "confidence": confidence,
+        "reasons":    signals,
+        "is_good_setup": abs(score) >= 4,
+    }
+
+
+# ── SIGNAL GENERATION ─────────────────────────────────────────────────────
+
+def generate_signal(pair, ind, setup):
+    price = ind["price"]
+    d     = setup["direction"]
+    pip   = PAIRS[pair]["pip"]
+
+    sl_dist  = round(price * 0.0015, 5)
+    tp1_dist = round(sl_dist * 1.5, 5)
+    tp2_dist = round(sl_dist * 2.5, 5)
+    tp3_dist = round(sl_dist * 4.0, 5)
+
+    if d == "BUY":
+        sl  = round(price - sl_dist, 5)
+        tp1 = round(price + tp1_dist, 5)
+        tp2 = round(price + tp2_dist, 5)
+        tp3 = round(price + tp3_dist, 5)
+        inv = round(price - sl_dist * 1.5, 5)
+    else:
+        sl  = round(price + sl_dist, 5)
+        tp1 = round(price - tp1_dist, 5)
+        tp2 = round(price - tp2_dist, 5)
+        tp3 = round(price - tp3_dist, 5)
+        inv = round(price + sl_dist * 1.5, 5)
+
+    rr = "1:" + str(round(tp2_dist / sl_dist, 1))
+
+    # Ask Groq for technical & sentiment summary
+    prompt = (
+        "You are a professional " + pair + " scalping analyst.\n"
+        "Current price: " + str(price) + "\n"
+        "RSI: " + str(ind["rsi"]) + "\n"
+        "EMA9: " + str(ind["ema9"]) + " EMA21: " + str(ind["ema21"]) + " EMA50: " + str(ind["ema50"]) + "\n"
+        "EMA trend: " + ind["ema_trend"] + "\n"
+        "Volume ratio vs average: " + str(ind["vol_ratio"]) + "x\n"
+        "Setup signals: " + ", ".join(setup["reasons"]) + "\n"
+        "Signal direction: " + d + "\n\n"
+        "Write a 2 sentence technical summary and 1 sentence market sentiment. "
+        "Return ONLY JSON: {\"technicalSummary\":\"...\",\"sentiment\":\"...\"}"
+    )
+
     try:
-        url = "https://query1.finance.yahoo.com/v8/finance/chart/GC=F"
-        r = requests.get(url, headers=headers, timeout=8)
-        price = r.json()["chart"]["result"][0]["meta"]["regularMarketPrice"]
-        price = float(price)
-        if GOLD_PRICE_MIN < price < GOLD_PRICE_MAX:
-            log.info("Price from Yahoo GC=F: $" + str(price))
-            return price, "Yahoo Finance"
-    except Exception as e:
-        log.warning("Yahoo GC=F failed: " + str(e))
+        resp = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=200,
+            temperature=0.3,
+        )
+        raw = resp.choices[0].message.content.replace("```json","").replace("```","").strip()
+        commentary = json.loads(raw[raw.find("{"):raw.rfind("}")+1])
+    except Exception:
+        commentary = {
+            "technicalSummary": "Setup detected based on RSI, EMA crossover and volume analysis.",
+            "sentiment": "Signal generated from live technical indicators."
+        }
 
-    # Source 2: Yahoo Finance XAUUSD=X spot
-    try:
-        url = "https://query2.finance.yahoo.com/v8/finance/chart/XAUUSD=X"
-        r = requests.get(url, headers=headers, timeout=8)
-        price = r.json()["chart"]["result"][0]["meta"]["regularMarketPrice"]
-        price = float(price)
-        if GOLD_PRICE_MIN < price < GOLD_PRICE_MAX:
-            log.info("Price from Yahoo XAUUSD: $" + str(price))
-            return price, "Yahoo Finance Spot"
-    except Exception as e:
-        log.warning("Yahoo XAUUSD failed: " + str(e))
-
-    # Source 3: Twelve Data free API
-    try:
-        url = "https://api.twelvedata.com/price?symbol=XAU/USD&apikey=demo"
-        r = requests.get(url, timeout=8)
-        price = float(r.json().get("price", 0))
-        if GOLD_PRICE_MIN < price < GOLD_PRICE_MAX:
-            log.info("Price from TwelveData: $" + str(price))
-            return price, "TwelveData"
-    except Exception as e:
-        log.warning("TwelveData failed: " + str(e))
-
-    # Source 4: goldprice.org API
-    try:
-        url = "https://data-asg.goldprice.org/dbXRates/USD"
-        r = requests.get(url, headers=headers, timeout=8)
-        data = r.json()
-        price = float(data["items"][0]["xauPrice"])
-        if GOLD_PRICE_MIN < price < GOLD_PRICE_MAX:
-            log.info("Price from goldprice.org: $" + str(price))
-            return price, "GoldPrice.org"
-    except Exception as e:
-        log.warning("goldprice.org failed: " + str(e))
-
-    log.warning("All price sources failed")
-    return None, "unavailable"
-
-
-def build_prompt(price, source):
     now_utc = datetime.now(timezone.utc)
     hour = now_utc.hour
+    if 6 <= hour < 12:     session = "London"
+    elif 12 <= hour < 15:  session = "Overlap"
+    elif 15 <= hour < 21:  session = "New York"
+    else:                  session = "Asian"
 
-    if 6 <= hour < 12:
-        session = "London"
-    elif 12 <= hour < 15:
-        session = "Overlap"
-    elif 15 <= hour < 21:
-        session = "New York"
-    else:
-        session = "Asian"
-
-    p = round(price, 2)
-    return (
-        "You are a professional XAU/USD scalping trader.\n\n"
-        "TODAY'S LIVE GOLD PRICE: $" + str(p) + " per troy ounce (source: " + source + ")\n"
-        "Current UTC time: " + now_utc.strftime("%H:%M") + " | Session: " + session + "\n\n"
-        "CRITICAL RULES - you MUST follow these exactly:\n"
-        "1. entry price MUST be between $" + str(round(p - 2, 2)) + " and $" + str(round(p + 2, 2)) + "\n"
-        "2. For BUY: stopLoss = entry minus $8 to $12, takeProfit1 = entry plus $8, takeProfit2 = entry plus $16, takeProfit3 = entry plus $28\n"
-        "3. For SELL: stopLoss = entry plus $8 to $12, takeProfit1 = entry minus $8, takeProfit2 = entry minus $16, takeProfit3 = entry minus $28\n"
-        "4. support levels must be BELOW $" + str(p) + "\n"
-        "5. resistance levels must be ABOVE $" + str(p) + "\n"
-        "6. invalidationLevel for BUY = entry minus $15, for SELL = entry plus $15\n\n"
-        "Return ONLY this JSON, no other text:\n"
-        '{"signal":"BUY","timeframe":"5m","entry":' + str(p) + ',"stopLoss":0.00,"takeProfit1":0.00,"takeProfit2":0.00,"takeProfit3":0.00,"riskReward":"1:2.0","confidence":75,"technicalSummary":"write 2 sentences about current technicals","sentiment":"write 1 sentence about gold market","keyLevels":{"support":[0.00,0.00],"resistance":[0.00,0.00]},"invalidationLevel":0.00,"sessionContext":"' + session + '"}'
-    )
+    return {
+        "pair":             PAIRS[pair]["name"],
+        "signal":           d,
+        "timeframe":        "5m",
+        "entry":            price,
+        "stopLoss":         sl,
+        "takeProfit1":      tp1,
+        "takeProfit2":      tp2,
+        "takeProfit3":      tp3,
+        "riskReward":       rr,
+        "confidence":       setup["confidence"],
+        "technicalSummary": commentary.get("technicalSummary", ""),
+        "sentiment":        commentary.get("sentiment", ""),
+        "supports":         ind["supports"],
+        "resistances":      ind["resistances"],
+        "invalidationLevel":inv,
+        "sessionContext":   session,
+        "setupReasons":     setup["reasons"],
+        "rsi":              ind["rsi"],
+        "ema_trend":        ind["ema_trend"],
+        "vol_ratio":        ind["vol_ratio"],
+    }
 
 
-def generate_signal():
-    price, source = get_gold_price()
-
-    if not price:
-        raise ValueError("Could not fetch live gold price from any source")
-
-    prompt = build_prompt(price, source)
-
-    response = client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
-        messages=[
-            {"role": "system", "content": prompt},
-            {"role": "user", "content": "Generate the scalping signal now. Return ONLY the JSON object."}
-        ],
-        max_tokens=500,
-        temperature=0.2,
-    )
-
-    raw = response.choices[0].message.content
-    raw = raw.replace("```json", "").replace("```", "").strip()
-    start = raw.find("{")
-    end = raw.rfind("}") + 1
-    signal = json.loads(raw[start:end])
-
-    # Force correct entry price regardless of what AI returns
-    signal["entry"] = round(price, 2)
-    signal["_livePrice"] = "$" + str(round(price, 2))
-    signal["_source"] = source
-    return signal
-
+# ── FORMAT MESSAGE ─────────────────────────────────────────────────────────
 
 def fmt(s):
-    d = s.get("signal", "?")
-    c = s.get("confidence", 0)
+    d   = s["signal"]
+    c   = s["confidence"]
     bar = "#" * (c // 10) + "-" * (10 - c // 10)
-    support = s.get("keyLevels", {}).get("support", [])
-    resistance = s.get("keyLevels", {}).get("resistance", [])
-    sup = " | ".join("$" + str(round(v, 2)) for v in support)
-    res = " | ".join("$" + str(round(v, 2)) for v in resistance)
+    sup = " | ".join("$" + str(v) for v in s["supports"])
+    res = " | ".join("$" + str(v) for v in s["resistances"])
+    reasons = "\n".join("  + " + r for r in s["setupReasons"])
     now = datetime.now(timezone.utc).strftime("%H:%M UTC")
-    live = s.get("_livePrice", "N/A")
-    src = s.get("_source", "")
     lines = [
-        "XAU/USD SIGNAL: " + d,
-        "Timeframe: " + s.get("timeframe", "?") + " | Session: " + s.get("sessionContext", "?"),
-        "Live Spot: " + live + " (" + src + ")",
-        "--------------------",
-        "Entry:        " + live,
-        "Stop Loss:    $" + str(round(s.get("stopLoss", 0), 2)),
-        "TP1:          $" + str(round(s.get("takeProfit1", 0), 2)),
-        "TP2:          $" + str(round(s.get("takeProfit2", 0), 2)),
-        "TP3:          $" + str(round(s.get("takeProfit3", 0), 2)),
-        "--------------------",
-        "R:R:          " + s.get("riskReward", "?"),
-        "Invalidation: $" + str(round(s.get("invalidationLevel", 0), 2)),
-        "--------------------",
+        "SIGNAL: " + s["pair"] + " " + d,
+        "Timeframe: " + s["timeframe"] + " | Session: " + s["sessionContext"],
+        "====================",
+        "Entry:        $" + str(s["entry"]),
+        "Stop Loss:    $" + str(s["stopLoss"]),
+        "TP1:          $" + str(s["takeProfit1"]),
+        "TP2:          $" + str(s["takeProfit2"]),
+        "TP3:          $" + str(s["takeProfit3"]),
+        "====================",
+        "R:R:          " + s["riskReward"],
+        "Invalidation: $" + str(s["invalidationLevel"]),
+        "====================",
+        "RSI: " + str(s["rsi"]) + " | EMA: " + s["ema_trend"] + " | Vol: " + str(s["vol_ratio"]) + "x",
         "Support:    " + sup,
         "Resistance: " + res,
-        "--------------------",
-        s.get("technicalSummary", ""),
-        s.get("sentiment", ""),
-        "--------------------",
+        "====================",
+        "Setup reasons:",
+        reasons,
+        "====================",
+        s["technicalSummary"],
+        s["sentiment"],
+        "====================",
         "Confidence: [" + bar + "] " + str(c) + "%",
         "Time: " + now,
         "For educational purposes only."
@@ -178,27 +318,67 @@ def fmt(s):
     return "\n".join(lines)
 
 
-async def job():
-    bot = Bot(token=TELEGRAM_TOKEN)
-    log.info("Generating signal...")
+# ── SCAN JOB ───────────────────────────────────────────────────────────────
+
+async def scan_pair(pair, bot):
+    cfg = PAIRS[pair]
+    log.info("Scanning " + pair + "...")
+
     try:
-        s = generate_signal()
-        await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=fmt(s))
-        log.info("Sent: " + str(s.get("signal")) + " | Live price: " + str(s.get("_livePrice")))
+        df = fetch_candles(cfg["yahoo"])
+        if len(df) < 55:
+            log.warning(pair + ": not enough candles")
+            return
+
+        price = get_live_price(cfg["yahoo"])
+        if not (cfg["min"] < price < cfg["max"]):
+            log.warning(pair + ": price out of valid range: " + str(price))
+            return
+
+        # Use live price as last close
+        df.at[df.index[-1], "close"] = price
+
+        ind   = get_indicators(df)
+        setup = detect_setup(ind)
+
+        log.info(pair + " | Price: $" + str(ind["price"]) + " | RSI: " + str(ind["rsi"]) + " | Score: " + str(setup["score"]) + " | Setup: " + str(setup["is_good_setup"]))
+
+        if not setup["is_good_setup"]:
+            log.info(pair + ": no good setup detected, skipping")
+            return
+
+        # Enforce minimum gap between signals
+        now = datetime.now(timezone.utc)
+        if last_signal[pair]:
+            gap = (now - last_signal[pair]).total_seconds() / 60
+            if gap < MIN_SIGNAL_GAP:
+                log.info(pair + ": last signal was " + str(round(gap)) + " min ago, waiting")
+                return
+
+        signal = generate_signal(pair, ind, setup)
+        message = fmt(signal)
+        await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text=message)
+        last_signal[pair] = now
+        log.info(pair + ": signal sent - " + setup["direction"] + " @ $" + str(ind["price"]))
+
     except Exception as e:
-        log.error("Error: " + str(e))
-        try:
-            await bot.send_message(chat_id=TELEGRAM_CHAT_ID, text="Error: " + str(e)[:200])
-        except Exception:
-            pass
+        log.error(pair + " error: " + str(e))
+
+
+async def scan_all():
+    bot = Bot(token=TELEGRAM_TOKEN)
+    for pair in PAIRS:
+        await scan_pair(pair, bot)
+        await asyncio.sleep(2)
 
 
 async def main():
-    log.info("Bot starting - every " + str(INTERVAL_MINUTES) + " min")
-    await job()
+    log.info("Bot starting - scanning every " + str(CHECK_INTERVAL) + " min for good setups")
+    await scan_all()
     scheduler = AsyncIOScheduler()
-    scheduler.add_job(job, "interval", minutes=INTERVAL_MINUTES)
+    scheduler.add_job(scan_all, "interval", minutes=CHECK_INTERVAL)
     scheduler.start()
+    log.info("Scheduler running")
     while True:
         await asyncio.sleep(60)
 
